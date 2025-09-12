@@ -1,0 +1,5 @@
+# Environment configuration
+.env
+
+# Log files
+.logs/
