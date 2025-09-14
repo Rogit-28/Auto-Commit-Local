@@ -8,7 +8,7 @@
 
 .NOTES
     Author:  Rogit
-    Version: 0.1.0
+    Version: 0.2.0
     Requires: PowerShell 5.1+, Git for Windows
 #>
 
@@ -27,6 +27,7 @@ function Get-Config {
         INTERVAL_MINUTES  = "5"
         LOG_PATH          = ".logs\auto-commit.log"
         PUSH_ENABLED      = "true"
+        MAX_LOG_SIZE_KB   = "1024"
     }
 
     $config = @{}
@@ -61,8 +62,75 @@ function Get-Config {
 }
 
 # ============================================================================
+# LOGGING MODULE
+# ============================================================================
+
+function Initialize-LogDirectory {
+    param([string]$LogPath)
+
+    $logDir = Split-Path $LogPath -Parent
+    if ($logDir -and -not (Test-Path $logDir)) {
+        New-Item -ItemType Directory -Path $logDir -Force | Out-Null
+    }
+}
+
+function Invoke-LogRotation {
+    <#
+    .SYNOPSIS
+        Rotates log file if it exceeds the configured size threshold.
+    #>
+    param(
+        [string]$LogPath,
+        [int]$MaxSizeKB
+    )
+
+    if (Test-Path $LogPath) {
+        $fileSizeKB = (Get-Item $LogPath).Length / 1024
+        if ($fileSizeKB -ge $MaxSizeKB) {
+            $timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
+            $rotatedName = $LogPath -replace '\.log$', "-$timestamp.log"
+            Move-Item -Path $LogPath -Destination $rotatedName -Force
+            Write-Host "[INFO] Log rotated to: $rotatedName" -ForegroundColor Cyan
+        }
+    }
+}
+
+function Write-Log {
+    <#
+    .SYNOPSIS
+        Writes a timestamped log entry to both console and log file.
+    #>
+    param(
+        [string]$Message,
+        [ValidateSet("INFO", "WARN", "ERROR", "SUCCESS")]
+        [string]$Level = "INFO",
+        [string]$LogPath
+    )
+
+    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    $logEntry = "[$timestamp] [$Level] $Message"
+
+    # Console output with color coding
+    switch ($Level) {
+        "INFO"    { Write-Host $logEntry -ForegroundColor White }
+        "WARN"    { Write-Host $logEntry -ForegroundColor Yellow }
+        "ERROR"   { Write-Host $logEntry -ForegroundColor Red }
+        "SUCCESS" { Write-Host $logEntry -ForegroundColor Green }
+    }
+
+    # File output
+    if ($LogPath) {
+        Add-Content -Path $LogPath -Value $logEntry -ErrorAction SilentlyContinue
+    }
+}
+
+# ============================================================================
 # ENTRY POINT (placeholder — more to come)
 # ============================================================================
 
 $config = Get-Config
-Write-Host "Config loaded. Repo: $($config['REPO_PATH']), Branch: $($config['BRANCH'])"
+$logPath = $config["LOG_PATH"]
+Initialize-LogDirectory -LogPath $logPath
+
+Write-Log -Message "Config loaded. Repo: $($config['REPO_PATH'])" -Level "INFO" -LogPath $logPath
+Write-Log -Message "Logging system initialized." -Level "SUCCESS" -LogPath $logPath
