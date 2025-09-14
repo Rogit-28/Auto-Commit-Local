@@ -8,7 +8,7 @@
 
 .NOTES
     Author:  Rogit
-    Version: 0.3.0
+    Version: 0.4.0
     Requires: PowerShell 5.1+, Git for Windows
 #>
 
@@ -220,7 +220,82 @@ function Test-RepoHealth {
 }
 
 # ============================================================================
-# ENTRY POINT (placeholder — git operations coming next)
+# GIT OPERATIONS
+# ============================================================================
+
+function Get-PendingChanges {
+    <#
+    .SYNOPSIS
+        Returns list of pending changes in the repository.
+    #>
+    $status = git status --porcelain 2>&1
+    return $status
+}
+
+function Invoke-StageAndCommit {
+    <#
+    .SYNOPSIS
+        Stages all changes and creates an auto-generated commit.
+    .OUTPUTS
+        Returns $true if commit was successful.
+    #>
+    param(
+        [string]$LogPath,
+        [int]$MaxFileSizeMB
+    )
+
+    # Check for oversized files and warn
+    $oversizedFiles = @()
+    $status = git status --porcelain 2>&1
+    foreach ($line in $status) {
+        if ($line -match "^..\s+(.+)$") {
+            $filePath = $matches[1].Trim()
+            if (Test-Path $filePath) {
+                $fileSizeMB = (Get-Item $filePath).Length / 1MB
+                if ($fileSizeMB -gt $MaxFileSizeMB) {
+                    $oversizedFiles += $filePath
+                    Write-Log -Message "Skipping oversized file ($([math]::Round($fileSizeMB, 1))MB): $filePath" -Level "WARN" -LogPath $LogPath
+                }
+            }
+        }
+    }
+
+    # Stage all changes
+    git add -A 2>&1 | Out-Null
+
+    # Unstage oversized files if any
+    foreach ($file in $oversizedFiles) {
+        git reset HEAD -- $file 2>&1 | Out-Null
+    }
+
+    # Verify there are still staged changes after filtering
+    $staged = git diff --cached --name-only 2>&1
+    if (-not $staged) {
+        Write-Log -Message "No eligible files to commit after size filtering." -Level "INFO" -LogPath $LogPath
+        return $false
+    }
+
+    # Generate commit message
+    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    $commitMessage = "auto: updated files on $timestamp"
+
+    # Commit
+    $commitOutput = git commit -m $commitMessage 2>&1
+    $commitSuccess = $LASTEXITCODE -eq 0
+
+    if ($commitSuccess) {
+        $shortHash = (git rev-parse --short HEAD 2>&1)
+        Write-Log -Message "Commit $shortHash created: $commitMessage" -Level "SUCCESS" -LogPath $LogPath
+    }
+    else {
+        Write-Log -Message "Commit failed: $commitOutput" -Level "ERROR" -LogPath $LogPath
+    }
+
+    return $commitSuccess
+}
+
+# ============================================================================
+# ENTRY POINT (placeholder — push logic and main loop coming next)
 # ============================================================================
 
 $config = Get-Config
@@ -229,7 +304,7 @@ $repoPath = $config["REPO_PATH"]
 
 Initialize-LogDirectory -LogPath $logPath
 
-Write-Log -Message "Config loaded. Repo: $repoPath" -Level "INFO" -LogPath $logPath
+Write-Log -Message "Auto-Commit Daemon starting..." -Level "INFO" -LogPath $logPath
 
 # Lock file check
 $lockPath = Get-LockFilePath -LogPath $logPath
@@ -239,12 +314,17 @@ if (Test-LockFile -LockPath $lockPath) {
 }
 New-LockFile -LockPath $lockPath
 
-# Health check
+Set-Location $repoPath
+
 if (Test-RepoHealth -RepoPath $repoPath -LogPath $logPath) {
-    Write-Log -Message "Repository health check passed." -Level "SUCCESS" -LogPath $logPath
-}
-else {
-    Write-Log -Message "Repository health check failed." -Level "ERROR" -LogPath $logPath
+    $changes = Get-PendingChanges
+    if ($changes) {
+        Write-Log -Message "Changes detected. Staging and committing..." -Level "INFO" -LogPath $logPath
+        $result = Invoke-StageAndCommit -LogPath $logPath -MaxFileSizeMB ([int]$config["MAX_FILE_SIZE_MB"])
+    }
+    else {
+        Write-Log -Message "No changes detected." -Level "INFO" -LogPath $logPath
+    }
 }
 
 Remove-LockFile -LockPath $lockPath
