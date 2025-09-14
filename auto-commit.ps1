@@ -8,7 +8,7 @@
 
 .NOTES
     Author:  Rogit
-    Version: 0.2.0
+    Version: 0.3.0
     Requires: PowerShell 5.1+, Git for Windows
 #>
 
@@ -28,6 +28,7 @@ function Get-Config {
         LOG_PATH          = ".logs\auto-commit.log"
         PUSH_ENABLED      = "true"
         MAX_LOG_SIZE_KB   = "1024"
+        MAX_FILE_SIZE_MB  = "50"
     }
 
     $config = @{}
@@ -125,12 +126,125 @@ function Write-Log {
 }
 
 # ============================================================================
-# ENTRY POINT (placeholder — more to come)
+# LOCK FILE MANAGEMENT
+# ============================================================================
+
+function Get-LockFilePath {
+    param([string]$LogPath)
+    $logDir = Split-Path $LogPath -Parent
+    return Join-Path $logDir ".lockfile"
+}
+
+function Test-LockFile {
+    <#
+    .SYNOPSIS
+        Checks if another instance is already running via lock file.
+    #>
+    param([string]$LockPath)
+
+    if (Test-Path $LockPath) {
+        $storedPid = Get-Content $LockPath -ErrorAction SilentlyContinue
+        if ($storedPid) {
+            $process = Get-Process -Id $storedPid -ErrorAction SilentlyContinue
+            if ($process) {
+                return $true  # Another instance is running
+            }
+            # Stale lock file — previous instance crashed
+            Remove-Item $LockPath -Force -ErrorAction SilentlyContinue
+        }
+    }
+    return $false
+}
+
+function New-LockFile {
+    param([string]$LockPath)
+    $PID | Out-File -FilePath $LockPath -Force
+}
+
+function Remove-LockFile {
+    param([string]$LockPath)
+    if (Test-Path $LockPath) {
+        Remove-Item $LockPath -Force -ErrorAction SilentlyContinue
+    }
+}
+
+# ============================================================================
+# REPOSITORY HEALTH CHECKS
+# ============================================================================
+
+function Test-RepoHealth {
+    <#
+    .SYNOPSIS
+        Validates repository state before performing Git operations.
+    .OUTPUTS
+        Returns $true if repo is healthy and ready for operations.
+    #>
+    param(
+        [string]$RepoPath,
+        [string]$LogPath
+    )
+
+    # Check .git directory exists
+    $gitDir = Join-Path $RepoPath ".git"
+    if (-not (Test-Path $gitDir)) {
+        Write-Log -Message "Repository not found at $RepoPath — missing .git directory." -Level "ERROR" -LogPath $LogPath
+        return $false
+    }
+
+    # Check for merge in progress
+    if (Test-Path (Join-Path $gitDir "MERGE_HEAD")) {
+        Write-Log -Message "Merge in progress — skipping this cycle." -Level "WARN" -LogPath $LogPath
+        return $false
+    }
+
+    # Check for rebase in progress
+    if ((Test-Path (Join-Path $gitDir "rebase-apply")) -or
+        (Test-Path (Join-Path $gitDir "rebase-merge"))) {
+        Write-Log -Message "Rebase in progress — skipping this cycle." -Level "WARN" -LogPath $LogPath
+        return $false
+    }
+
+    # Check for cherry-pick in progress
+    if (Test-Path (Join-Path $gitDir "CHERRY_PICK_HEAD")) {
+        Write-Log -Message "Cherry-pick in progress — skipping this cycle." -Level "WARN" -LogPath $LogPath
+        return $false
+    }
+
+    # Check for index lock (another git process running)
+    if (Test-Path (Join-Path $gitDir "index.lock")) {
+        Write-Log -Message "Git index is locked — another Git process may be running. Skipping." -Level "WARN" -LogPath $LogPath
+        return $false
+    }
+
+    return $true
+}
+
+# ============================================================================
+# ENTRY POINT (placeholder — git operations coming next)
 # ============================================================================
 
 $config = Get-Config
 $logPath = $config["LOG_PATH"]
+$repoPath = $config["REPO_PATH"]
+
 Initialize-LogDirectory -LogPath $logPath
 
-Write-Log -Message "Config loaded. Repo: $($config['REPO_PATH'])" -Level "INFO" -LogPath $logPath
-Write-Log -Message "Logging system initialized." -Level "SUCCESS" -LogPath $logPath
+Write-Log -Message "Config loaded. Repo: $repoPath" -Level "INFO" -LogPath $logPath
+
+# Lock file check
+$lockPath = Get-LockFilePath -LogPath $logPath
+if (Test-LockFile -LockPath $lockPath) {
+    Write-Log -Message "Another instance is already running. Exiting." -Level "ERROR" -LogPath $logPath
+    exit 1
+}
+New-LockFile -LockPath $lockPath
+
+# Health check
+if (Test-RepoHealth -RepoPath $repoPath -LogPath $logPath) {
+    Write-Log -Message "Repository health check passed." -Level "SUCCESS" -LogPath $logPath
+}
+else {
+    Write-Log -Message "Repository health check failed." -Level "ERROR" -LogPath $logPath
+}
+
+Remove-LockFile -LockPath $lockPath
