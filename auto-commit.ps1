@@ -8,7 +8,7 @@
 
 .NOTES
     Author:  Rogit
-    Version: 0.4.0
+    Version: 0.5.0
     Requires: PowerShell 5.1+, Git for Windows
 #>
 
@@ -29,6 +29,7 @@ function Get-Config {
         PUSH_ENABLED      = "true"
         MAX_LOG_SIZE_KB   = "1024"
         MAX_FILE_SIZE_MB  = "50"
+        NETWORK_CHECK_URL = "https://github.com"
     }
 
     $config = @{}
@@ -220,6 +221,30 @@ function Test-RepoHealth {
 }
 
 # ============================================================================
+# NETWORK CONNECTIVITY CHECK
+# ============================================================================
+
+function Test-NetworkConnection {
+    <#
+    .SYNOPSIS
+        Tests network connectivity by attempting to reach the configured URL.
+    #>
+    param([string]$CheckUrl)
+
+    try {
+        $request = [System.Net.WebRequest]::Create($CheckUrl)
+        $request.Timeout = 5000  # 5 second timeout
+        $request.Method = "HEAD"
+        $response = $request.GetResponse()
+        $response.Close()
+        return $true
+    }
+    catch {
+        return $false
+    }
+}
+
+# ============================================================================
 # GIT OPERATIONS
 # ============================================================================
 
@@ -294,13 +319,51 @@ function Invoke-StageAndCommit {
     return $commitSuccess
 }
 
+function Invoke-Push {
+    <#
+    .SYNOPSIS
+        Pushes committed changes to the remote repository.
+    .OUTPUTS
+        Returns $true if push was successful.
+    #>
+    param(
+        [string]$Branch,
+        [string]$LogPath,
+        [string]$NetworkCheckUrl
+    )
+
+    # Network connectivity check
+    if (-not (Test-NetworkConnection -CheckUrl $NetworkCheckUrl)) {
+        Write-Log -Message "Network unavailable — push deferred to next cycle." -Level "WARN" -LogPath $LogPath
+        return $true  # Return true to not halt the daemon — just skip push
+    }
+
+    Write-Log -Message "Pushing to origin/$Branch..." -Level "INFO" -LogPath $LogPath
+
+    $pushOutput = git push origin $Branch 2>&1
+    $pushSuccess = $LASTEXITCODE -eq 0
+
+    if ($pushSuccess) {
+        Write-Log -Message "Push successful to origin/$Branch." -Level "SUCCESS" -LogPath $LogPath
+    }
+    else {
+        Write-Log -Message "Push failed: $pushOutput" -Level "ERROR" -LogPath $LogPath
+        Write-Log -Message "Daemon will halt — manual intervention required." -Level "ERROR" -LogPath $LogPath
+    }
+
+    return $pushSuccess
+}
+
 # ============================================================================
-# ENTRY POINT (placeholder — push logic and main loop coming next)
+# ENTRY POINT (placeholder — main loop coming next)
 # ============================================================================
 
 $config = Get-Config
 $logPath = $config["LOG_PATH"]
 $repoPath = $config["REPO_PATH"]
+$branch = $config["BRANCH"]
+$pushEnabled = $config["PUSH_ENABLED"] -eq "true"
+$networkCheckUrl = $config["NETWORK_CHECK_URL"]
 
 Initialize-LogDirectory -LogPath $logPath
 
@@ -320,7 +383,14 @@ if (Test-RepoHealth -RepoPath $repoPath -LogPath $logPath) {
     $changes = Get-PendingChanges
     if ($changes) {
         Write-Log -Message "Changes detected. Staging and committing..." -Level "INFO" -LogPath $logPath
-        $result = Invoke-StageAndCommit -LogPath $logPath -MaxFileSizeMB ([int]$config["MAX_FILE_SIZE_MB"])
+        $commitOk = Invoke-StageAndCommit -LogPath $logPath -MaxFileSizeMB ([int]$config["MAX_FILE_SIZE_MB"])
+
+        if ($commitOk -and $pushEnabled) {
+            $pushOk = Invoke-Push -Branch $branch -LogPath $logPath -NetworkCheckUrl $networkCheckUrl
+            if (-not $pushOk) {
+                Write-Log -Message "Push failure detected." -Level "ERROR" -LogPath $logPath
+            }
+        }
     }
     else {
         Write-Log -Message "No changes detected." -Level "INFO" -LogPath $logPath
