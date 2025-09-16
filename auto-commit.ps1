@@ -5,10 +5,11 @@
 .DESCRIPTION
     Monitors a specified Git repository for file changes, automatically
     commits them at periodic intervals, and pushes to the remote branch.
+    Designed as a lightweight background daemon for Windows 10/11.
 
 .NOTES
     Author:  Rogit
-    Version: 0.5.0
+    Version: 1.0.0
     Requires: PowerShell 5.1+, Git for Windows
 #>
 
@@ -355,46 +356,116 @@ function Invoke-Push {
 }
 
 # ============================================================================
-# ENTRY POINT (placeholder — main loop coming next)
+# MAIN DAEMON LOOP
 # ============================================================================
 
-$config = Get-Config
-$logPath = $config["LOG_PATH"]
-$repoPath = $config["REPO_PATH"]
-$branch = $config["BRANCH"]
-$pushEnabled = $config["PUSH_ENABLED"] -eq "true"
-$networkCheckUrl = $config["NETWORK_CHECK_URL"]
+function Start-AutoCommitDaemon {
+    <#
+    .SYNOPSIS
+        Main entry point — starts the auto-commit daemon loop.
+    #>
 
-Initialize-LogDirectory -LogPath $logPath
+    # Load configuration
+    $config = Get-Config
+    $repoPath        = $config["REPO_PATH"]
+    $branch          = $config["BRANCH"]
+    $intervalMinutes = [int]$config["INTERVAL_MINUTES"]
+    $logPath         = $config["LOG_PATH"]
+    $pushEnabled     = $config["PUSH_ENABLED"] -eq "true"
+    $maxLogSizeKB    = [int]$config["MAX_LOG_SIZE_KB"]
+    $maxFileSizeMB   = [int]$config["MAX_FILE_SIZE_MB"]
+    $networkCheckUrl = $config["NETWORK_CHECK_URL"]
 
-Write-Log -Message "Auto-Commit Daemon starting..." -Level "INFO" -LogPath $logPath
+    # Initialize logging
+    Initialize-LogDirectory -LogPath $logPath
 
-# Lock file check
-$lockPath = Get-LockFilePath -LogPath $logPath
-if (Test-LockFile -LockPath $lockPath) {
-    Write-Log -Message "Another instance is already running. Exiting." -Level "ERROR" -LogPath $logPath
-    exit 1
-}
-New-LockFile -LockPath $lockPath
+    Write-Log -Message "========================================" -Level "INFO" -LogPath $logPath
+    Write-Log -Message "Auto-Commit Daemon starting..." -Level "INFO" -LogPath $logPath
+    Write-Log -Message "  Repo:     $repoPath" -Level "INFO" -LogPath $logPath
+    Write-Log -Message "  Branch:   $branch" -Level "INFO" -LogPath $logPath
+    Write-Log -Message "  Interval: $intervalMinutes min" -Level "INFO" -LogPath $logPath
+    Write-Log -Message "  Push:     $pushEnabled" -Level "INFO" -LogPath $logPath
+    Write-Log -Message "========================================" -Level "INFO" -LogPath $logPath
 
-Set-Location $repoPath
+    # Lock file check
+    $lockPath = Get-LockFilePath -LogPath $logPath
+    if (Test-LockFile -LockPath $lockPath) {
+        Write-Log -Message "Another instance is already running. Exiting." -Level "ERROR" -LogPath $logPath
+        return
+    }
+    New-LockFile -LockPath $lockPath
 
-if (Test-RepoHealth -RepoPath $repoPath -LogPath $logPath) {
-    $changes = Get-PendingChanges
-    if ($changes) {
-        Write-Log -Message "Changes detected. Staging and committing..." -Level "INFO" -LogPath $logPath
-        $commitOk = Invoke-StageAndCommit -LogPath $logPath -MaxFileSizeMB ([int]$config["MAX_FILE_SIZE_MB"])
+    # Register cleanup handler for graceful shutdown
+    $cleanupBlock = {
+        Write-Host "`n[INFO] Shutting down daemon..." -ForegroundColor Cyan
+        $lockPath = Get-LockFilePath -LogPath $logPath
+        Remove-LockFile -LockPath $lockPath
+        Write-Log -Message "Daemon stopped by user." -Level "INFO" -LogPath $logPath
+    }
 
-        if ($commitOk -and $pushEnabled) {
-            $pushOk = Invoke-Push -Branch $branch -LogPath $logPath -NetworkCheckUrl $networkCheckUrl
-            if (-not $pushOk) {
-                Write-Log -Message "Push failure detected." -Level "ERROR" -LogPath $logPath
+    try {
+        Register-EngineEvent -SourceIdentifier PowerShell.Exiting -Action $cleanupBlock | Out-Null
+    }
+    catch {
+        # Silently continue if event registration fails
+    }
+
+    # Main loop
+    $running = $true
+    while ($running) {
+        try {
+            # Rotate logs if needed
+            Invoke-LogRotation -LogPath $logPath -MaxSizeKB $maxLogSizeKB
+
+            # Navigate to repo
+            Set-Location $repoPath
+
+            # Health check
+            if (-not (Test-RepoHealth -RepoPath $repoPath -LogPath $logPath)) {
+                Write-Log -Message "Health check failed — waiting for next cycle." -Level "WARN" -LogPath $logPath
+                Start-Sleep -Seconds ($intervalMinutes * 60)
+                continue
+            }
+
+            # Check for changes
+            $changes = Get-PendingChanges
+            if ($changes) {
+                $changeCount = ($changes | Measure-Object).Count
+                Write-Log -Message "Detected $changeCount change(s). Processing..." -Level "INFO" -LogPath $logPath
+
+                # Stage and commit
+                $commitOk = Invoke-StageAndCommit -LogPath $logPath -MaxFileSizeMB $maxFileSizeMB
+
+                if ($commitOk -and $pushEnabled) {
+                    $pushOk = Invoke-Push -Branch $branch -LogPath $logPath -NetworkCheckUrl $networkCheckUrl
+                    if (-not $pushOk) {
+                        Write-Log -Message "Push failure — daemon halting to prevent further issues." -Level "ERROR" -LogPath $logPath
+                        $running = $false
+                        continue
+                    }
+                }
+            }
+            else {
+                Write-Log -Message "No changes detected. Idle." -Level "INFO" -LogPath $logPath
             }
         }
+        catch {
+            Write-Log -Message "Unexpected error: $_" -Level "ERROR" -LogPath $logPath
+        }
+
+        if ($running) {
+            Write-Log -Message "Next cycle in $intervalMinutes minute(s)." -Level "INFO" -LogPath $logPath
+            Start-Sleep -Seconds ($intervalMinutes * 60)
+        }
     }
-    else {
-        Write-Log -Message "No changes detected." -Level "INFO" -LogPath $logPath
-    }
+
+    # Cleanup
+    Remove-LockFile -LockPath $lockPath
+    Write-Log -Message "Daemon stopped." -Level "INFO" -LogPath $logPath
 }
 
-Remove-LockFile -LockPath $lockPath
+# ============================================================================
+# ENTRY POINT
+# ============================================================================
+
+Start-AutoCommitDaemon
