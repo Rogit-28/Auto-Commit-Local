@@ -1,8 +1,8 @@
 # PRD: Local Git Auto Commit & Push Daemon (Windows)
 
-**Version:** 1.0
+**Version:** 1.2
 **Author:** Rogit
-**Last Updated:** 2025-09-16
+**Last Updated:** 2025-09-20
 
 ---
 
@@ -26,6 +26,9 @@ manual commit intervention — functioning as a silent background daemon on Wind
 * Auto-generation of meaningful commit messages.
 * Authenticated remote pushes to GitHub.
 * Failure resilience with minimal user intervention.
+* Log rotation and retention policies.
+* Network-awareness before push attempts.
+* Graceful handling of Git state anomalies (merge, rebase, lock files).
 
 ### Out of Scope
 
@@ -41,17 +44,21 @@ manual commit intervention — functioning as a silent background daemon on Wind
 
 ### 3.1 Functional Requirements
 
-| ID  | Requirement          | Description                                                                                                    | Priority |
-| --- | -------------------- | -------------------------------------------------------------------------------------------------------------- | -------- |
-| F1  | Folder Monitoring    | The daemon continuously monitors one specified folder for file modifications, additions, or deletions.         | High     |
-| F2  | Batch Commit         | Changes are batched and committed at scheduled intervals (default: every 5 minutes).                           | High     |
-| F3  | Auto Commit Message  | Commit messages are auto-generated in the format: `auto: updated files on YYYY-MM-DD HH:MM:SS`.               | Medium   |
-| F4  | Auto Push            | After a successful commit, changes are pushed to the remote branch.                                            | High     |
-| F5  | Author Attribution   | Commits must use globally configured Git author name and email that map to the user's GitHub identity.         | High     |
-| F6  | Logging              | Each run logs activity (timestamp, commit status, push status, errors) to a local `.logs/auto-commit.log`.     | Medium   |
-| F7  | Conflict Handling    | If a remote push fails due to conflicts, the daemon suspends further actions until manual intervention.        | Medium   |
-| F8  | Network-Aware Push   | Pushes should only attempt if a valid network connection exists.                                               | Medium   |
-| F9  | Repository Integrity | The daemon verifies `.git` folder exists and repo is not mid-merge or rebasing before performing actions.      | High     |
+| ID  | Requirement          | Description                                                                                                              | Priority |
+| --- | -------------------- | ------------------------------------------------------------------------------------------------------------------------ | -------- |
+| F1  | Folder Monitoring    | The daemon continuously monitors one specified folder for file modifications, additions, or deletions.                   | High     |
+| F2  | Batch Commit         | Changes are batched and committed at scheduled intervals (default: every 5 minutes).                                     | High     |
+| F3  | Auto Commit Message  | Commit messages are auto-generated in the format: `auto: updated files on YYYY-MM-DD HH:MM:SS`.                         | Medium   |
+| F4  | Auto Push            | After a successful commit, changes are pushed to the remote branch.                                                      | High     |
+| F5  | Author Attribution   | Commits must use globally configured Git author name and email that map to the user's GitHub identity.                   | High     |
+| F6  | Logging              | Each run logs activity (timestamp, commit status, push status, errors) to a local `.logs/auto-commit.log`.               | Medium   |
+| F7  | Conflict Handling    | If a remote push fails due to conflicts, the daemon suspends further actions and logs the error for manual intervention. | Medium   |
+| F8  | Network-Aware Push   | Pushes should only attempt if a valid network connection exists. Skips push silently if offline.                         | Medium   |
+| F9  | Repository Integrity | The daemon verifies `.git` folder exists and repo is not mid-merge/rebase before performing actions.                     | High     |
+| F10 | Log Rotation         | Log files are automatically rotated when exceeding a configurable size threshold (default: 1MB).                         | Low      |
+| F11 | Lock File Guard      | Prevents multiple instances of the daemon from running simultaneously via a PID lock file.                               | Medium   |
+| F12 | Graceful Shutdown    | Handles Ctrl+C and system signals cleanly, removing lock files and logging shutdown.                                     | Medium   |
+| F13 | File Size Filter     | Optionally skip staging files exceeding a configurable size limit to prevent large binary commits.                       | Low      |
 
 ### 3.2 Non-Functional Requirements
 
@@ -61,7 +68,8 @@ manual commit intervention — functioning as a silent background daemon on Wind
 | N2  | Reliability     | No duplicate commits or infinite commit loops.                                      |
 | N3  | Security        | Credentials are never stored in plaintext. Uses Git Credential Manager or SSH keys. |
 | N4  | Compatibility   | Works on Windows 10/11 PowerShell 5.1+ environment.                                |
-| N5  | Maintainability | Configurable via `.env` file defining interval, repo path, and branch.              |
+| N5  | Maintainability | Configurable via `.env` file defining interval, repo path, branch, and log path.    |
+| N6  | Observability   | All errors, warnings, and state transitions are logged with ISO 8601 timestamps.    |
 
 ---
 
@@ -71,60 +79,148 @@ manual commit intervention — functioning as a silent background daemon on Wind
 
 A single **background PowerShell process** orchestrates Git operations:
 
+```
++---------------------------------------------------+
+|                auto-commit.ps1                     |
+|                                                    |
+|  +----------+   +--------------+   +-----------+  |
+|  |  Config   |-->|  Health Check |-->|  Stage &  |  |
+|  |  Loader   |   |  & Safeguard  |   |  Commit   |  |
+|  +----------+   +--------------+   +-----+-----+  |
+|       |                                  |         |
+|       v                                  v         |
+|  +----------+                     +----------+     |
+|  |  Logger   |<-------------------| Push      |     |
+|  |  Module   |                    | Routine   |     |
+|  +----------+                     +----------+     |
+|                                                    |
+|  +----------------------------------------------+  |
+|  |         Timer Loop (Scheduler)                |  |
+|  |    Executes cycle every N minutes             |  |
+|  +----------------------------------------------+  |
++---------------------------------------------------+
+```
+
 1. **Timer Loop (Scheduler):**
    * Executes every *n* minutes (configurable).
    * Calls the commit routine.
+   * Respects lock file to prevent concurrent execution.
 
-2. **Commit Routine:**
-   * Verifies repo health.
+2. **Config Loader:**
+   * Reads `.env` file with key=value pairs.
+   * Supports quoted and unquoted values.
+   * Falls back to sane defaults if `.env` is missing.
+
+3. **Health Check & Safeguard Module:**
+   * Verifies `.git` directory exists.
+   * Checks for merge/rebase in progress.
+   * Detects Git index lock files.
+   * Validates repo is not in detached HEAD state.
+
+4. **Commit Routine:**
    * Detects changes using `git status --porcelain`.
    * If changes exist -> stage all -> commit with autogenerated message.
 
-3. **Push Routine:**
-   * Attempts push to the current branch.
+5. **Push Routine:**
+   * Tests network connectivity before push attempt.
+   * Attempts push to the configured remote branch.
    * Logs output and status.
-   * If push fails due to upstream divergence, logs warning and halts further runs.
+   * If push fails due to upstream divergence, logs warning and halts.
+
+6. **Logger Module:**
+   * Timestamped log entries with severity levels.
+   * Automatic log rotation at configurable threshold.
+   * Console + file dual output.
 
 ### 4.2 Components
 
-| Component              | Description                                                       |
-| ---------------------- | ----------------------------------------------------------------- |
-| `auto-commit.ps1`     | Main PowerShell daemon script that runs in loop.                  |
-| `.env`                 | Configuration file for repo path, interval, branch, and log path. |
-| `auto-commit.log`      | Persistent log file stored under `.logs/`.                        |
-| Windows Task Scheduler | Service to trigger the PowerShell script on login or at interval. |
+| Component                | Description                                                          |
+| ------------------------ | -------------------------------------------------------------------- |
+| `auto-commit.ps1`       | Main PowerShell daemon script containing all logic.                  |
+| `.env`                   | Configuration file for repo path, interval, branch, and log path.    |
+| `.env.example`           | Template configuration file committed to repo.                       |
+| `.logs/auto-commit.log`  | Persistent log file (auto-rotated).                                  |
+| `.logs/.lockfile`        | PID lock file preventing duplicate daemon instances.                 |
+| `setup-scheduler.ps1`   | Helper script to register Windows Task Scheduler job.                |
+| `.gitignore`             | Excludes .env, logs, and temp files from version control.            |
 
 ### 4.3 Configuration Parameters
 
-| Parameter          | Default                              | Description                          |
-| ------------------ | ------------------------------------ | ------------------------------------ |
-| `REPO_PATH`       | Current working directory            | Path to local Git repository.        |
-| `BRANCH`          | `main`                               | Branch to push to.                   |
-| `INTERVAL_MINUTES`| `5`                                  | Time interval between commit cycles. |
-| `LOG_PATH`        | `.logs\auto-commit.log`              | Log file path.                       |
-| `PUSH_ENABLED`    | `true`                               | Whether to push after commit.        |
+| Parameter           | Default                              | Description                              |
+| ------------------- | ------------------------------------ | ---------------------------------------- |
+| `REPO_PATH`         | Current working directory            | Path to local Git repository.            |
+| `BRANCH`            | `main`                               | Branch to push to.                       |
+| `INTERVAL_MINUTES`  | `5`                                  | Time interval between commit cycles.     |
+| `LOG_PATH`          | `.logs\auto-commit.log`              | Log file path.                           |
+| `PUSH_ENABLED`      | `true`                               | Whether to push after commit.            |
+| `MAX_LOG_SIZE_KB`   | `1024`                               | Max log file size before rotation (KB).  |
+| `MAX_FILE_SIZE_MB`  | `50`                                 | Max individual file size to stage (MB).  |
+| `NETWORK_CHECK_URL` | `https://github.com`                 | URL to ping for connectivity check.      |
 
 ---
 
 ## 5. Operational Flow
 
-### 5.1 Commit-Push Cycle
+### 5.1 Startup Sequence
 
-1. Daemon starts (manual launch or scheduled task).
-2. Checks repo validity:
+1. Load configuration from `.env` (with defaults fallback).
+2. Validate repo path exists and contains `.git`.
+3. Create log directory if missing.
+4. Acquire lock file (exit if another instance running).
+5. Register Ctrl+C handler for graceful shutdown.
+6. Enter main timer loop.
+
+### 5.2 Commit-Push Cycle
+
+1. **Health Check:**
    * `.git` folder exists.
-   * `git status` returns clean working tree state.
-3. Detects file modifications (`git status --porcelain`).
-4. If non-empty:
+   * No merge/rebase/cherry-pick in progress.
+   * No `index.lock` present.
+
+2. **Change Detection:**
+   * `git status --porcelain` for modified/untracked files.
+   * If empty -> skip cycle.
+
+3. **Stage & Commit:**
    * `git add -A`
-   * `git commit -m "auto: updated files on <timestamp>"`
+   * Generate timestamped commit message.
+   * `git commit -m "<message>"`
+
+4. **Push (if enabled):**
+   * Check network connectivity.
    * `git push origin <branch>`
-5. Logs result.
-6. Waits for `INTERVAL_MINUTES` and repeats.
+   * On failure: log error, halt daemon.
+
+5. **Log & Wait:**
+   * Log cycle result (success/skip/error).
+   * Sleep for configured interval.
+   * Repeat.
+
+### 5.3 Shutdown Sequence
+
+1. Ctrl+C or system signal received.
+2. Log shutdown event.
+3. Remove lock file.
+4. Exit cleanly.
 
 ---
 
-## 6. Stack & Dependencies
+## 6. Safeguards
+
+| Check                | Mechanism                                                  |
+| -------------------- | ---------------------------------------------------------- |
+| Merge in progress    | Skip cycle if `.git/MERGE_HEAD` exists.                    |
+| Unresolved rebase    | Skip if `.git/rebase-apply` or `.git/rebase-merge` exists. |
+| Cherry-pick active   | Skip if `.git/CHERRY_PICK_HEAD` exists.                    |
+| Git index locked     | Skip if `.git/index.lock` exists.                          |
+| Network unavailable  | Skip push, retry next cycle.                               |
+| Credential missing   | Fail gracefully, log warning.                              |
+| Duplicate instance   | Lock file prevents concurrent runs.                        |
+| Large file detected  | Skip files exceeding MAX_FILE_SIZE_MB.                     |
+
+---
+
+## 7. Stack & Dependencies
 
 * **Language:** PowerShell 5.1+ (ships with Windows 10/11)
 * **Runtime:** Windows 10/11
@@ -132,3 +228,41 @@ A single **background PowerShell process** orchestrates Git operations:
 * **Auth:** SSH key or Git Credential Manager Core
 * **Scheduler:** Windows Task Scheduler (optional, for auto-start)
 * **External Dependencies:** None (pure PowerShell + Git CLI)
+
+---
+
+## 8. Success Metrics
+
+| Metric                      | Target                              |
+| --------------------------- | ----------------------------------- |
+| Commit accuracy             | 100% change coverage per cycle      |
+| Push success rate           | >= 95% (excluding network issues)   |
+| Log retention               | 30 days                             |
+| CPU usage                   | <2% sustained                       |
+| User intervention frequency | <= 1 per month                      |
+| Daemon uptime               | 99%+ during active working hours    |
+
+---
+
+## 9. Risk Assessment
+
+| Risk                                        | Impact | Mitigation                                           |
+| ------------------------------------------- | ------ | ---------------------------------------------------- |
+| Infinite commit loop due to generated files | High   | `.gitignore` enforcement and commit diff validation  |
+| Accidental overwrite due to force push      | Medium | Disallow `--force` in automation                     |
+| GitHub credential expiry                    | Medium | Use credential manager or SSH-based authentication   |
+| Network unavailability                      | Low    | Retry silently on next interval                      |
+| Large binary file commits                   | Low    | File size filter (MAX_FILE_SIZE_MB)                  |
+| Multiple daemon instances                   | Medium | PID lock file prevents concurrent execution          |
+| Log file disk exhaustion                    | Low    | Automatic log rotation at size threshold             |
+
+---
+
+## 10. Future Enhancements (v2)
+
+* Multi-repo monitoring with config array.
+* Tray icon / notification system for Windows.
+* Commit message templates with file-change summaries.
+* Configurable `.gitignore` pattern-based file exclusion.
+* Integration with Windows Event Log for system-level monitoring.
+* Optional Slack/Discord webhook notifications on push failure.
