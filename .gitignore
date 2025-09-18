@@ -1,5 +1,23 @@
-# Environment configuration
+# Environment configuration (contains local paths)
 .env
 
 # Log files
 .logs/
+
+# PowerShell temp files
+*.tmp
+*~
+
+# Windows system files
+Thumbs.db
+desktop.ini
+
+# IDE / Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS generated files
+$RECYCLE.BIN/
+*.lnk
