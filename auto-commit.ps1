@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Local Git Auto Commit & Push Daemon for Windows.
 
@@ -33,10 +33,7 @@ function Get-Config {
         NETWORK_CHECK_URL = "https://github.com"
     }
 
-    $config = @{}
-    foreach ($key in $defaults.Keys) {
-        $config[$key] = $defaults[$key]
-    }
+    $config = $defaults.Clone()
 
     $envFile = Join-Path (Get-Location).Path ".env"
     if (Test-Path $envFile) {
@@ -58,7 +55,7 @@ function Get-Config {
         }
     }
     else {
-        Write-Host "[WARN] No .env file found at $envFile — using defaults." -ForegroundColor Yellow
+        Write-Host "[WARN] No .env file found at $envFile - using defaults." -ForegroundColor Yellow
     }
 
     return $config
@@ -147,11 +144,15 @@ function Test-LockFile {
     if (Test-Path $LockPath) {
         $storedPid = Get-Content $LockPath -ErrorAction SilentlyContinue
         if ($storedPid) {
-            $process = Get-Process -Id $storedPid -ErrorAction SilentlyContinue
-            if ($process) {
-                return $true  # Another instance is running
+            # Validate PID is a valid integer before querying process table
+            $parsedPid = 0
+            if ([int]::TryParse($storedPid.Trim(), [ref]$parsedPid)) {
+                $process = Get-Process -Id $parsedPid -ErrorAction SilentlyContinue
+                if ($process) {
+                    return $true  # Another instance is running
+                }
             }
-            # Stale lock file — previous instance crashed
+            # Stale or corrupted lock file - clean up
             Remove-Item $LockPath -Force -ErrorAction SilentlyContinue
         }
     }
@@ -189,32 +190,39 @@ function Test-RepoHealth {
     # Check .git directory exists
     $gitDir = Join-Path $RepoPath ".git"
     if (-not (Test-Path $gitDir)) {
-        Write-Log -Message "Repository not found at $RepoPath — missing .git directory." -Level "ERROR" -LogPath $LogPath
+        Write-Log -Message "Repository not found at $RepoPath - missing .git directory." -Level "ERROR" -LogPath $LogPath
         return $false
     }
 
     # Check for merge in progress
     if (Test-Path (Join-Path $gitDir "MERGE_HEAD")) {
-        Write-Log -Message "Merge in progress — skipping this cycle." -Level "WARN" -LogPath $LogPath
+        Write-Log -Message "Merge in progress - skipping this cycle." -Level "WARN" -LogPath $LogPath
         return $false
     }
 
     # Check for rebase in progress
     if ((Test-Path (Join-Path $gitDir "rebase-apply")) -or
         (Test-Path (Join-Path $gitDir "rebase-merge"))) {
-        Write-Log -Message "Rebase in progress — skipping this cycle." -Level "WARN" -LogPath $LogPath
+        Write-Log -Message "Rebase in progress - skipping this cycle." -Level "WARN" -LogPath $LogPath
         return $false
     }
 
     # Check for cherry-pick in progress
     if (Test-Path (Join-Path $gitDir "CHERRY_PICK_HEAD")) {
-        Write-Log -Message "Cherry-pick in progress — skipping this cycle." -Level "WARN" -LogPath $LogPath
+        Write-Log -Message "Cherry-pick in progress - skipping this cycle." -Level "WARN" -LogPath $LogPath
         return $false
     }
 
     # Check for index lock (another git process running)
     if (Test-Path (Join-Path $gitDir "index.lock")) {
-        Write-Log -Message "Git index is locked — another Git process may be running. Skipping." -Level "WARN" -LogPath $LogPath
+        Write-Log -Message "Git index is locked - another Git process may be running. Skipping." -Level "WARN" -LogPath $LogPath
+        return $false
+    }
+
+    # Check for detached HEAD state
+    $headRef = Get-Content (Join-Path $gitDir "HEAD") -ErrorAction SilentlyContinue
+    if ($headRef -and -not $headRef.StartsWith("ref:")) {
+        Write-Log -Message "Detached HEAD state detected - skipping this cycle." -Level "WARN" -LogPath $LogPath
         return $false
     }
 
@@ -254,7 +262,10 @@ function Get-PendingChanges {
     .SYNOPSIS
         Returns list of pending changes in the repository.
     #>
-    $status = git status --porcelain 2>&1
+    $status = @(git status --porcelain 2>&1)
+    if ($status.Count -eq 1 -and [string]::IsNullOrWhiteSpace($status[0])) {
+        return @()
+    }
     return $status
 }
 
@@ -288,6 +299,10 @@ function Invoke-StageAndCommit {
 
     # Stage all changes
     git add -A 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        Write-Log -Message "Failed to stage changes (git add exit code: $LASTEXITCODE)." -Level "ERROR" -LogPath $LogPath
+        return $false
+    }
 
     # Unstage oversized files if any
     foreach ($file in $oversizedFiles) {
@@ -335,8 +350,8 @@ function Invoke-Push {
 
     # Network connectivity check
     if (-not (Test-NetworkConnection -CheckUrl $NetworkCheckUrl)) {
-        Write-Log -Message "Network unavailable — push deferred to next cycle." -Level "WARN" -LogPath $LogPath
-        return $true  # Return true to not halt the daemon — just skip push
+        Write-Log -Message "Network unavailable - push deferred to next cycle." -Level "WARN" -LogPath $LogPath
+        return $true  # Return true to not halt the daemon - just skip push
     }
 
     Write-Log -Message "Pushing to origin/$Branch..." -Level "INFO" -LogPath $LogPath
@@ -349,7 +364,7 @@ function Invoke-Push {
     }
     else {
         Write-Log -Message "Push failed: $pushOutput" -Level "ERROR" -LogPath $LogPath
-        Write-Log -Message "Daemon will halt — manual intervention required." -Level "ERROR" -LogPath $LogPath
+        Write-Log -Message "Daemon will halt - manual intervention required." -Level "ERROR" -LogPath $LogPath
     }
 
     return $pushSuccess
@@ -362,7 +377,7 @@ function Invoke-Push {
 function Start-AutoCommitDaemon {
     <#
     .SYNOPSIS
-        Main entry point — starts the auto-commit daemon loop.
+        Main entry point - starts the auto-commit daemon loop.
     #>
 
     # Load configuration
@@ -407,7 +422,7 @@ function Start-AutoCommitDaemon {
         Register-EngineEvent -SourceIdentifier PowerShell.Exiting -Action $cleanupBlock | Out-Null
     }
     catch {
-        # Silently continue if event registration fails
+        Write-Log -Message "Could not register shutdown handler: $_ - lock file may need manual cleanup." -Level "WARN" -LogPath $logPath
     }
 
     # Main loop
@@ -422,7 +437,7 @@ function Start-AutoCommitDaemon {
 
             # Health check
             if (-not (Test-RepoHealth -RepoPath $repoPath -LogPath $logPath)) {
-                Write-Log -Message "Health check failed — waiting for next cycle." -Level "WARN" -LogPath $logPath
+                Write-Log -Message "Health check failed - waiting for next cycle." -Level "WARN" -LogPath $logPath
                 Start-Sleep -Seconds ($intervalMinutes * 60)
                 continue
             }
@@ -439,9 +454,9 @@ function Start-AutoCommitDaemon {
                 if ($commitOk -and $pushEnabled) {
                     $pushOk = Invoke-Push -Branch $branch -LogPath $logPath -NetworkCheckUrl $networkCheckUrl
                     if (-not $pushOk) {
-                        Write-Log -Message "Push failure — daemon halting to prevent further issues." -Level "ERROR" -LogPath $logPath
+                        Write-Log -Message "Push failure - daemon halting to prevent further issues." -Level "ERROR" -LogPath $logPath
                         $running = $false
-                        continue
+                        break
                     }
                 }
             }
